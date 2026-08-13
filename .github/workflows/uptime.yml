@@ -27,7 +27,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TARGET: https://ocr.kolosal.ai/health
+  TARGET: https://ocr.kolosal.ai:9999/health
   LABEL: uptime
 
 jobs:
