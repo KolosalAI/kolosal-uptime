@@ -37,6 +37,12 @@ jobs:
       - name: Probe endpoint
         id: probe
         run: |
+          # GitHub runs steps as `bash -e`. A failing curl is the NORMAL case
+          # here, so errexit MUST be off: with it on, the first failed probe
+          # kills this step before healthy=0 is recorded, the job fails, and
+          # the alert steps below never run — the site goes down and nobody is
+          # told. This step must always exit 0 and report via its outputs.
+          set +e
           set -u
           BODY_FILE="$(mktemp)"
           evidence=""
