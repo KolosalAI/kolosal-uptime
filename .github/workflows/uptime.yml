@@ -1,0 +1,183 @@
+name: uptime
+
+# Off-box availability monitor for ocr.kolosal.ai.
+#
+# Deliberately lives in a PUBLIC repo, separate from KolosalAI/ocr.kolosal.ai:
+# public repos get unlimited free Actions minutes, so a 5-minute cadence is
+# free. In the private product repo the same cadence would bill ~8,640
+# minutes/month against a 2,000-minute free tier.
+#
+# It must never run on the box it watches — on 2026-08-13 that host went dark
+# at the network level (no ICMP, no SSH, no HTTPS) and any monitor living on it
+# would have died with it.
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub's scheduler lags under load, so treat real
+    # detection latency as ~5-20 min, not 5.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+# Never let a slow run overlap the next tick and double-open an issue.
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+env:
+  TARGET: https://ocr.kolosal.ai/health
+  LABEL: uptime
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe endpoint
+        id: probe
+        run: |
+          set -u
+          BODY_FILE="$(mktemp)"
+          evidence=""
+          healthy=0
+
+          # 3 attempts, 20s apart. A single failed curl from a GitHub runner is
+          # more often a runner hiccup than a real outage; requiring 3 in a row
+          # is what keeps this from crying wolf.
+          for i in 1 2 3; do
+            w=$(curl -s -o "$BODY_FILE" \
+                  -w '%{http_code}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_total}' \
+                  --max-time 20 "$TARGET" 2>/dev/null); rc=$?
+            code="${w%%|*}"; [ -z "$code" ] && code="000"
+            body="$(head -c 200 "$BODY_FILE" 2>/dev/null | tr -d '\n')"
+            evidence="attempt=${i} curl_exit=${rc} http=${code} timings_dns_conn_tls_total=${w#*|}"
+
+            # A 200 alone is not enough: Caddy can answer 200 while the app
+            # behind it is broken. Require the app to name itself healthy.
+            if [ "$rc" -eq 0 ] && [ "$code" = "200" ] \
+               && printf '%s' "$body" | grep -q '"status":"healthy"'; then
+              healthy=1
+              break
+            fi
+            [ "$i" -lt 3 ] && sleep 20
+          done
+
+          # tr strips newlines so a remote response cannot inject extra keys
+          # into GITHUB_OUTPUT.
+          {
+            echo "healthy=${healthy}"
+            echo "evidence=${evidence}"
+            echo "body=$(head -c 200 "$BODY_FILE" 2>/dev/null | tr -d '\n\r')"
+          } >> "$GITHUB_OUTPUT"
+
+          rm -f "$BODY_FILE"
+          echo "healthy=${healthy} ${evidence}"
+          exit 0
+
+      - name: Ensure alert label exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create "$LABEL" \
+            --color B60205 \
+            --description "Automated availability alert" \
+            --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+
+      - name: Open alert issue (only if one is not already open)
+        if: steps.probe.outputs.healthy == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE: ${{ steps.probe.outputs.evidence }}
+          RESP_BODY: ${{ steps.probe.outputs.body }}
+        run: |
+          set -euo pipefail
+
+          # Dedup is the whole game here. At a 5-minute cadence a one-hour
+          # outage fires 12 runs; without this check that is 12 issues and 12
+          # emails. One outage must produce exactly one issue.
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+                       --label "$LABEL" --state open --limit 1 \
+                       --json number --jq '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            echo "Alert issue #${existing} already open — staying quiet."
+            exit 0
+          fi
+
+          detected="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+          # Written to a file rather than passed inline so the remote response
+          # body never reaches the shell as code.
+          cat > /tmp/alert.md <<MARKDOWN
+          \`${TARGET}\` failed **3 consecutive probes**, 20s apart.
+
+          **Detected:** ${detected}
+
+          ### Evidence
+          \`\`\`
+          ${EVIDENCE}
+          \`\`\`
+          Response body (first 200 bytes):
+          \`\`\`
+          ${RESP_BODY}
+          \`\`\`
+
+          ### Reading the evidence
+          | Signal | Means |
+          |---|---|
+          | \`curl_exit=28\`, \`http=000\` | Timeout — nothing accepted the connection. Suspect the host/network, as on 2026-08-13. |
+          | \`curl_exit=6\` | DNS failure — the A record for ocr.kolosal.ai broke. |
+          | \`curl_exit=35\` or \`60\` | TLS failure — expired or mis-issued certificate. |
+          | \`http=502\` or \`503\` | Caddy is up, the app behind it is not. Check the containers. |
+          | \`http=200\` but body wrong | App answering but unhealthy. |
+
+          ### First moves
+          Host details are deliberately kept out of this public repo. The
+          runbook lives in the private product repo at \`docs/ops/README.md\`.
+
+          Triage order: ping the host, then check SSH, then check the app.
+          If ICMP **and** SSH are both dead the VM itself is down — that is a
+          hosting-provider console problem, not an app bug. Capture
+          \`uptime; who -b; df -h /\` *before* rebooting anything; boot time is
+          the only thing that distinguishes a reboot from a network detach.
+
+          This issue closes itself on the next successful probe.
+          MARKDOWN
+
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --label "$LABEL" \
+            --title "🔴 ocr.kolosal.ai is DOWN" \
+            --body-file /tmp/alert.md
+
+      - name: Close alert issue on recovery
+        if: steps.probe.outputs.healthy == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE: ${{ steps.probe.outputs.evidence }}
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+                       --label "$LABEL" --state open --limit 1 \
+                       --json number --jq '.[0].number // empty')
+
+          if [ -z "$existing" ]; then
+            echo "Healthy, nothing open. No action."
+            exit 0
+          fi
+
+          recovered="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+          cat > /tmp/recovered.md <<MARKDOWN
+          ✅ **Recovered** at ${recovered}.
+
+          \`\`\`
+          ${EVIDENCE}
+          \`\`\`
+          Closing automatically. Compare this against the detection time above —
+          that window is the customer-visible outage.
+          MARKDOWN
+
+          gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
+            --body-file /tmp/recovered.md
+          gh issue close "$existing" --repo "$GITHUB_REPOSITORY"

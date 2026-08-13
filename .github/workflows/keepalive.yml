@@ -1,0 +1,32 @@
+name: keepalive
+
+# GitHub disables scheduled workflows after 60 days without repo activity.
+# For a dedicated monitor repo that is the worst possible failure mode: the
+# monitor silently stops watching and you find out from a customer — exactly
+# the situation this repo exists to prevent.
+#
+# This commits a timestamp monthly so the repo never goes quiet.
+
+on:
+  schedule:
+    - cron: '0 3 1 * *'  # 03:00 UTC on the 1st of each month
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Touch heartbeat
+        run: |
+          set -euo pipefail
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > .keepalive
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          git commit -m "chore: keepalive (keeps scheduled workflows enabled)" || exit 0
+          git push
